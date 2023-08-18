@@ -1,0 +1,314 @@
+---
+title: "blackspotted-rougheye-SST"
+author: "Diana Baetscher"
+date: "2023-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Walkthrough of species id for unknown samples:
+
+Using the rds file output from microhaplot:
+1. read in rds files
+2. apply read depth filters
+3. apply allele balance filter
+
+
+```{r install-packages-and-load-functions}
+library(tidyverse)
+library(readxl)
+library(stringr)
+library(lubridate)
+library(rubias)
+library(ggpattern)
+
+
+source("../R/rockfish-funcs2.R")
+
+
+#### Call genos from the microhaplot rds files ####
+
+# the directory with the rds file
+dir <- "../data_AFSC/rds_files/"
+
+
+# cycle over them, read them and add the gtseq_run column on each.
+# at the end, bind them together.
+genos_long <- call_genos_from_haplotRDS(path = file.path(dir, "blackspot_rougheye_SST.rds"))
+
+#### In the end, let us get a data frame that includes genotypes for all the individuals  ####
+# and which explicitly has NAs in places where data are missing
+genos_long_explicit_NAs <- genos_long %>%
+  select(id) %>%
+  unique() %>%
+  unlist() %>%
+  unname() %>%
+  expand.grid(id = ., locus = unique(genos_long$locus), gene_copy = 1:2, stringsAsFactors = FALSE) %>%
+  tbl_df() %>% 
+  left_join(., genos_long) %>%
+  arrange(id, locus, gene_copy)
+
+  
+```
+
+```{r overall-pattern-of-missing-data}
+genos_long_explicit_NAs %>%
+  ggplot(aes(x = locus, y = id, fill = depth)) +
+  geom_tile()
+
+
+```
+There are five loci that drop-out in blackspotted and rougheye (and shortspine thornyhead).
+
+
+
+
+Using those genotypes...
+```{r}
+genos_long_explicit_NAs %>%
+  group_by(id) %>%
+  tally()
+
+```
+
+287 samples
+
+
+Look at missing data:
+180 gene copies total (90 loci x2)
+```{r}
+ind_to_toss <- genos_long_explicit_NAs %>%
+  group_by(id) %>%
+  filter(is.na(allele)) %>% # missing data
+  tally() %>%
+  arrange(desc(n)) %>% # remove samples with >20% missing data
+  filter(n > 36) 
+
+# remove those from the df
+genos_ind_filtered <- genos_long_explicit_NAs %>%
+  anti_join(., ind_to_toss)
+  
+```
+105 samples removed due to >20% missing data.
+
+
+
+```{r}
+ind_to_toss %>%
+  inner_join(., genos_long_explicit_NAs) %>%
+  ggplot(aes(x = locus, y = id, fill = depth)) +
+  geom_tile()
+
+
+```
+
+
+
+Load baseline data
+```{r baseline-data}
+# baseline data - curated, 997 indivs
+baseline <- readRDS("../new_baseline_data/processed/sebastes_spp_id_baseline_haplotypes.rds")
+
+# remove the 6 loci that had HWE and other issues
+to_remove <- read_csv("../data/loci_to_remove.csv")
+
+baseline90 <- baseline %>%
+  anti_join(., to_remove)
+
+# remind myself which species are in the baseline:
+baseline90 %>%
+  select(collection) %>%
+  unique() %>%
+  arrange()
+
+tossers <- baseline90 %>%
+  select(indiv, gtseq_run, id) %>%
+  unique() %>%
+  group_by(indiv) %>%
+  tally() %>%
+  filter(n >1)
+
+baseline90_one_each <- baseline90 %>%
+  anti_join(., tossers)
+
+# baseline data - curated, 997 indivs
+baseline_spp_info <- baseline90_one_each %>%
+  select(sample_type, repunit, collection, indiv, gtseq_run, id, species) %>%
+  unique()
+baseline_spp_info$gtseq_run <- as.character(baseline_spp_info$gtseq_run)
+
+```
+
+
+```{r baseline-format}
+# slim that down to just the matching field with the unknowns
+for_alleidx <- baseline90_one_each %>%
+  select(-indiv, -c(1:3, 12:13), -species)
+  
+
+for_alleidx$gtseq_run <- as.character(for_alleidx$gtseq_run)
+```
+
+
+
+```{r}
+# merge the two dataframes
+merged_df <- bind_rows(for_alleidx, genos_ind_filtered)
+
+# first make integers of the alleles
+alle_idxs <- merged_df %>% 
+  dplyr::select(gtseq_run, id, locus, gene_copy, allele) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(gtseq_run, id, locus, alleidx) # rubias can handle NA's, so no need to change them to 0's
+
+  
+# and spread the alleles
+two_col <- alle_idxs %>%
+  #group_by(indiv, locus) %>%
+  unite(loc, locus, gene_copy, sep = ".") %>%
+  #ungroup() %>%
+  select(-allele) %>%
+  pivot_wider(names_from = loc, values_from = alleidx) 
+
+
+```
+
+
+
+add back on info for reference and make two-column format for rubias
+```{r}
+# baseline
+reference <- two_col %>%
+  left_join(., baseline_spp_info) %>%
+  filter(!is.na(species)) %>%
+  select(-gtseq_run, -id, -species) %>%
+  select(sample_type, repunit, collection, indiv, everything())
+
+```
+
+```{r}
+# mixture
+rubias_mix <- two_col %>%
+  anti_join(., baseline_spp_info) %>%
+  select(-gtseq_run) %>%
+  mutate(sample_type = "mixture", collection = "blackspotted_rougheye", repunit = NA) %>%
+  select(sample_type, repunit, collection, everything()) %>%
+  rename(indiv = id)
+```
+
+## Mixture assignment with rubias
+
+
+```{r run-rubias}
+rubias_output <- infer_mixture(reference = reference, mixture = rubias_mix, gen_start_col = 5)
+
+# mixing proportions
+rubias_output$mixing_proportions %>%
+  ggplot(aes(x = collection, y = pi)) +
+  geom_bar(stat = "identity") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.95)
+  )
+
+```
+
+
+```{r individual-posteriors}
+# take the top output for each sample
+top_assign <- rubias_output$indiv_posteriors %>%
+  group_by(indiv) %>%
+  slice_max(., order_by = PofZ)
+
+
+top_assign 
+```
+
+```{r summary}
+top_assign %>%
+  filter(z_score < -3 | z_score > 3)
+
+```
+
+```{r filter-assignments}
+top_assign_filtered <- top_assign %>%
+  filter(z_score > -3 | z_score < 3) %>%
+  filter(PofZ > 0.9) 
+
+top_assign_filtered %>%
+  group_by(repunit) %>%
+  tally()
+
+
+```
+
+Map those results:
+
+```{r samplesheet-metadata}
+samplesheet <- read_csv("../data_AFSC/samplesheets/20230807_rockfish_SST.csv", skip = 18)
+meta <- read_csv("../data_AFSC/ABLG_database_20230724_export.csv")
+meta$ABLG <- as.character(meta$ABLG)
+
+results_for_map <- samplesheet %>%
+  select(Sample_ID, id) %>%
+  left_join(., top_assign, by = c("id" = "indiv")) %>%
+  mutate(Sample_ID = str_replace(Sample_ID, "ABLG", "")) %>%
+  left_join(., meta, by = c("Sample_ID" = "ABLG"))
+
+```
+
+
+```{r map-indiv-data}
+library(ggplot2)
+library(sf)  
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+goa_map <- ggplot(data = world) +
+  geom_sf() +
+  coord_sf(xlim = c(-140, -120), 
+           ylim = c(55, 48), 
+           expand = FALSE) 
+
+goa_map +
+  geom_jitter(data = results_for_map, aes(x = -1*StartLongitudeDD, y = StartLatitudeDD, color = repunit), size = 1, alpha = 0.5, width = 0.3, height = 0.3) +
+  scale_color_manual(values = c("darkred", "gold", "salmon", "darkorange", "dodgerblue", "lightblue", "midnightblue")) +
+  theme_bw() +
+  labs(x = "Longitude",
+       y = "Latitude",
+       color = "Species (genetic)",
+       shape = "Species (morphology)") +
+  theme(
+    legend.text = element_text(face = "italic"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+  ) +
+  scale_y_continuous(breaks = c(40, 45, 50, 55, 60, 65)) +
+  scale_x_continuous(breaks = c(-180, -160, -150, -140, -130, -120)) +
+  guides(color = guide_legend(
+    override.aes = list(alpha = 1, size = 3), 
+    label.theme = element_text(size = 12, face = "italic"),
+    title.theme = element_text(size = 14)),
+    shape = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+ggsave("pdf_outputs/blackspotted_rougheye_OwensLab_map.pdf", width = 6, height = 5)
+
+```
+
+
+```{r output-results-for-wes}
+blackspottedRougheye_sppID_results_20230818 <- results_for_map %>%
+  select(-id, -mixture_collection, -log_likelihood, -z_score, -n_miss_loci, -n_non_miss_loci, -missing_loci, -PofZ) %>%
+  rename(ABLG = Sample_ID)
+  
+write_csv(blackspottedRougheye_sppID_results_20230818, "csv_outputs/blackspottedRougheye_sppID_results_20230818.csv")
+```
+
