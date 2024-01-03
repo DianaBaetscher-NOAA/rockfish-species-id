@@ -1,13 +1,19 @@
 ---
-title: "blackspotted-rougheye-SST"
-author: "Diana Baetscher"
-date: "2023-08-18"
+title: "species-id-jan-2024"
+author: "diana baetscher"
+date: "2024-01-02"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+# suppress R warnings for packages
+defaultW <- getOption("warn")
+options(warn = -1)
 ```
+
+Processing rockfish species ID data from 2023-11-21.
 
 
 Walkthrough of species id for unknown samples:
@@ -25,6 +31,13 @@ library(stringr)
 library(lubridate)
 library(rubias)
 library(ggpattern)
+# for mapping
+library(ggplot2)
+library(sf)  
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+
 
 
 source("../R/rockfish-funcs2.R")
@@ -38,7 +51,7 @@ dir <- "../data_AFSC/rds_files/"
 
 # cycle over them, read them and add the gtseq_run column on each.
 # at the end, bind them together.
-genos_long <- call_genos_from_haplotRDS(path = file.path(dir, "blackspot_rougheye_SST.rds"))
+genos_long <- call_genos_from_haplotRDS(path = file.path(dir, "rockfish_multiSPP_id.rds"))
 
 #### In the end, let us get a data frame that includes genotypes for all the individuals  ####
 # and which explicitly has NAs in places where data are missing
@@ -55,17 +68,6 @@ genos_long_explicit_NAs <- genos_long %>%
   
 ```
 
-```{r overall-pattern-of-missing-data}
-genos_long_explicit_NAs %>%
-  ggplot(aes(x = locus, y = id, fill = depth)) +
-  geom_tile()
-
-
-```
-There are five loci that drop-out in blackspotted and rougheye (and shortspine thornyhead).
-
-
-
 
 Using those genotypes...
 ```{r}
@@ -75,7 +77,7 @@ genos_long_explicit_NAs %>%
 
 ```
 
-287 samples
+288 samples.
 
 
 Look at missing data:
@@ -93,20 +95,8 @@ genos_ind_filtered <- genos_long_explicit_NAs %>%
   anti_join(., ind_to_toss)
   
 ```
-105 samples removed due to >20% missing data.
 
-
-
-```{r}
-ind_to_toss %>%
-  inner_join(., genos_long_explicit_NAs) %>%
-  ggplot(aes(x = locus, y = id, fill = depth)) +
-  geom_tile()
-
-
-```
-
-
+21 samples to toss because of >20% missing data.
 
 Load baseline data
 ```{r baseline-data}
@@ -142,6 +132,7 @@ baseline_spp_info <- baseline90_one_each %>%
 baseline_spp_info$gtseq_run <- as.character(baseline_spp_info$gtseq_run)
 
 ```
+
 
 
 ```{r baseline-format}
@@ -197,10 +188,11 @@ reference <- two_col %>%
 rubias_mix <- two_col %>%
   anti_join(., baseline_spp_info) %>%
   select(-gtseq_run) %>%
-  mutate(sample_type = "mixture", collection = "blackspotted_rougheye", repunit = NA) %>%
+  mutate(sample_type = "mixture", collection = "spp_id", repunit = NA) %>%
   select(sample_type, repunit, collection, everything()) %>%
   rename(indiv = id)
 ```
+
 
 ## Mixture assignment with rubias
 
@@ -208,14 +200,8 @@ rubias_mix <- two_col %>%
 ```{r run-rubias}
 rubias_output <- infer_mixture(reference = reference, mixture = rubias_mix, gen_start_col = 5)
 
-# mixing proportions
-rubias_output$mixing_proportions %>%
-  ggplot(aes(x = collection, y = pi)) +
-  geom_bar(stat = "identity") +
-  theme(
-    axis.text.x = element_text(angle = 90, hjust = 0.95)
-  )
-
+# we know there are species sequenced that aren't currently in the baseline.
+# those should come out in the z-scores
 ```
 
 
@@ -229,106 +215,91 @@ top_assign <- rubias_output$indiv_posteriors %>%
 top_assign 
 ```
 
+
 ```{r summary}
 top_assign %>%
   filter(z_score < -3 | z_score > 3)
 
 ```
+A bunch of funky z-scores
 
-```{r filter-assignments}
-top_assign_filtered <- top_assign %>%
-  filter(z_score > -3 | z_score < 3) %>%
-  filter(PofZ > 0.9) 
 
-top_assign_filtered %>%
+
+
+### add metadata
+
+```{r read-in-sample-list}
+
+# sample list
+ss <- read_tsv("../data_AFSC/samples_list.txt", col_names = F)
+  
+# merge the ids with some of the new species
+results_w_spp <- as.data.frame(str_split_fixed(ss$X1, "_", 3)) %>%
+  select(V1, V2) %>%
+  rename(sample_id = V1, indiv = V2) %>%
+  mutate(indiv = str_replace(indiv, "S", "s")) %>%
+  unique() %>% # because there are two entries for each samples (R1 and R2)
+  left_join(., top_assign)
+
+
+results_w_spp %>%
+  filter(str_detect(sample_id, "ABLG")) %>%
+   filter(z_score < -3 | z_score > 3)
+
+```
+That's close enough to include.
+
+So the distribution of unknowns is:
+```{r}
+results_w_spp %>%
+  filter(str_detect(sample_id, "ABLG")) %>%
   group_by(repunit) %>%
   tally()
 
-
-```
-
-Map those results:
-
-```{r samplesheet-metadata}
-samplesheet <- read_csv("../data_AFSC/samplesheets/20230807_rockfish_SST.csv", skip = 18)
-meta <- read_csv("../data_AFSC/ABLG_database_20230724_export.csv")
-meta$ABLG <- as.character(meta$ABLG)
-
-results_for_map <- samplesheet %>%
-  select(Sample_ID, id) %>%
-  left_join(., top_assign, by = c("id" = "indiv")) %>%
-  mutate(Sample_ID = str_replace(Sample_ID, "ABLG", "")) %>%
-  left_join(., meta, by = c("Sample_ID" = "ABLG"))
-
 ```
 
 
-```{r map-indiv-data}
-library(ggplot2)
-library(sf)  
-library(rnaturalearth)
-library(rnaturalearthdata)
+The rest of the samples should be species to add to the baseline:
+```{r}
+results_w_spp %>%
+  filter(!str_detect(sample_id, "ABLG")) %>%
+  filter(z_score > -3 | z_score < 3) # within expected z-score distributions
 
-
-world <- ne_countries(scale = "medium", returnclass = "sf")
-
-goa_map <- ggplot(data = world) +
-  geom_sf() +
-  coord_sf(xlim = c(-140, -120), 
-           ylim = c(55, 48), 
-           expand = FALSE) 
-
-goa_map +
-  geom_jitter(data = results_for_map, aes(x = -1*StartLongitudeDD, y = StartLatitudeDD, color = repunit), size = 1, alpha = 0.5, width = 0.3, height = 0.3) +
-  scale_color_manual(values = c("darkred", "gold", "salmon", "darkorange", "dodgerblue", "lightblue", "midnightblue")) +
-  theme_bw() +
-  labs(x = "Longitude",
-       y = "Latitude",
-       color = "Species (genetic)",
-       shape = "Species (morphology)") +
-  theme(
-    legend.text = element_text(face = "italic"),
-    axis.title.x = element_text(margin = margin(t = 10)),
-    axis.title.y = element_text(margin = margin(r = 10)),
-  ) +
-  scale_y_continuous(breaks = c(40, 45, 50, 55, 60, 65)) +
-  scale_x_continuous(breaks = c(-180, -160, -150, -140, -130, -120)) +
-  guides(color = guide_legend(
-    override.aes = list(alpha = 1, size = 3), 
-    label.theme = element_text(size = 12, face = "italic"),
-    title.theme = element_text(size = 14)),
-    shape = guide_legend(override.aes = list(alpha = 1, size = 3)))
-
-ggsave("pdf_outputs/blackspotted_rougheye_OwensLab_map.pdf", width = 6, height = 5)
 
 ```
 
+Outputs:
+```{r}
+output <- results_w_spp %>%
+  filter(z_score > -3 & z_score < 3.1) %>% # within expected z-score distributions
+  select(sample_id, repunit, PofZ, z_score, n_non_miss_loci, n_miss_loci) %>%
+  rename(ABLG = sample_id)
 
-```{r output-results-for-wes}
-blackspottedRougheye_sppID_results_20230818 <- results_for_map %>%
-  select(-id, -mixture_collection, -log_likelihood, -z_score, -n_miss_loci, -n_non_miss_loci, -missing_loci, -PofZ) %>%
-  rename(ABLG = Sample_ID)
-  
-write_csv(blackspottedRougheye_sppID_results_20230818, "csv_outputs/blackspottedRougheye_sppID_results_20230818.csv")
+output %>%
+  write_csv("csv_outputs/20231121_rockfishSPP_genetic_ids.csv")
+
+output %>%
+  ggplot(aes(x = z_score)) +
+  geom_histogram() +
+  facet_wrap(~repunit) +
+  theme_bw()
 ```
 
-
-## checking on some ablg numbers that looked weird in the lcWGS data
+Samples to add to the baseline:
 
 ```{r}
-weirdos <- c(
-  "ABLG21309",
-  "ABLG21310",
-  "ABLG21312",
-  "ABLG21336")
+results_w_spp %>%
+  filter(!str_detect(sample_id, "ABLG")) %>%
+  filter(!str_detect(sample_id, "blue")) %>%
+  mutate(species = gsub("\\d", "", sample_id)) %>%
+  filter(!species %in% c("NTC-", "deacon")) %>%
+  group_by(species) %>%
+  ggplot(aes(x = z_score, fill = species)) +
+  geom_histogram() +
+  facet_wrap(~species) +
+  theme_bw()
 
-# reformat those for ease
-to_check <- as.data.frame(weirdos) %>%
-  rename(Sample_ID = weirdos) %>%
-  mutate(Sample_ID = str_replace(Sample_ID, "ABLG", ""))
-
-to_check %>%
-  left_join(., results_for_map)
+ggsave("pdf_outputs/norwegian_rockfish_zscores.pdf", width = 6, height = 3
+)
 ```
 
-Ok, not in that batch of species IDs. Let's check the earlier batch.

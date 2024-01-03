@@ -1,0 +1,726 @@
+---
+title: "species-id-single-rds"
+author: "Diana Baetscher"
+date: "2023-06-15"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+This markdown includes the analysis for the blackspotted and rougheye samples obtained from observers.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+# suppress R warnings for packages
+defaultW <- getOption("warn")
+options(warn = -1)
+```
+
+
+
+Walkthrough of species id for unknown samples:
+
+Using the rds file output from microhaplot:
+1. read in rds files
+2. apply read depth filters
+3. apply allele balance filter
+
+
+```{r install-packages-and-load-functions}
+library(tidyverse)
+library(readxl)
+library(stringr)
+library(lubridate)
+library(rubias)
+library(ggpattern)
+# for mapping
+library(ggplot2)
+library(sf)  
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+
+
+
+source("../R/rockfish-funcs2.R")
+
+
+#### Call genos from the microhaplot rds files ####
+
+# the directory with the rds file
+dir <- "../data_AFSC/rds_files/"
+
+
+# cycle over them, read them and add the gtseq_run column on each.
+# at the end, bind them together.
+genos_long <- call_genos_from_haplotRDS(path = file.path(dir, "blackspot_rougheye_sppID.rds"))
+
+#### In the end, let us get a data frame that includes genotypes for all the individuals  ####
+# and which explicitly has NAs in places where data are missing
+genos_long_explicit_NAs <- genos_long %>%
+  select(id) %>%
+  unique() %>%
+  unlist() %>%
+  unname() %>%
+  expand.grid(id = ., locus = unique(genos_long$locus), gene_copy = 1:2, stringsAsFactors = FALSE) %>%
+  tbl_df() %>% 
+  left_join(., genos_long) %>%
+  arrange(id, locus, gene_copy)
+
+  
+```
+
+
+Using those genotypes...
+```{r}
+genos_long_explicit_NAs %>%
+  group_by(id) %>%
+  tally()
+
+```
+
+253 samples
+
+
+Look at missing data:
+180 gene copies total (90 loci x2)
+```{r}
+ind_to_toss <- genos_long_explicit_NAs %>%
+  group_by(id) %>%
+  filter(is.na(allele)) %>% # missing data
+  tally() %>%
+  arrange(desc(n)) %>% # remove samples with >20% missing data
+  filter(n > 36) 
+
+# remove those from the df
+genos_ind_filtered <- genos_long_explicit_NAs %>%
+  anti_join(., ind_to_toss)
+  
+```
+11 samples removed due to >20% missing data.
+
+
+
+Load baseline data
+```{r baseline-data}
+# baseline data - curated, 997 indivs
+baseline <- readRDS("../new_baseline_data/processed/sebastes_spp_id_baseline_haplotypes.rds")
+
+# remove the 6 loci that had HWE and other issues
+to_remove <- read_csv("../data/loci_to_remove.csv")
+
+baseline90 <- baseline %>%
+  anti_join(., to_remove)
+
+# remind myself which species are in the baseline:
+baseline90 %>%
+  select(collection) %>%
+  unique() %>%
+  arrange()
+
+tossers <- baseline90 %>%
+  select(indiv, gtseq_run, id) %>%
+  unique() %>%
+  group_by(indiv) %>%
+  tally() %>%
+  filter(n >1)
+
+baseline90_one_each <- baseline90 %>%
+  anti_join(., tossers)
+
+# baseline data - curated, 997 indivs
+baseline_spp_info <- baseline90_one_each %>%
+  select(sample_type, repunit, collection, indiv, gtseq_run, id, species) %>%
+  unique()
+baseline_spp_info$gtseq_run <- as.character(baseline_spp_info$gtseq_run)
+
+```
+
+
+
+```{r baseline-format}
+# slim that down to just the matching field with the unknowns
+for_alleidx <- baseline90_one_each %>%
+  select(-indiv, -c(1:3, 12:13), -species)
+  
+
+for_alleidx$gtseq_run <- as.character(for_alleidx$gtseq_run)
+```
+
+
+
+```{r}
+# merge the two dataframes
+merged_df <- bind_rows(for_alleidx, genos_ind_filtered)
+
+# first make integers of the alleles
+alle_idxs <- merged_df %>% 
+  dplyr::select(gtseq_run, id, locus, gene_copy, allele) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(gtseq_run, id, locus, alleidx) # rubias can handle NA's, so no need to change them to 0's
+
+  
+# and spread the alleles
+two_col <- alle_idxs %>%
+  #group_by(indiv, locus) %>%
+  unite(loc, locus, gene_copy, sep = ".") %>%
+  #ungroup() %>%
+  select(-allele) %>%
+  pivot_wider(names_from = loc, values_from = alleidx) 
+
+
+```
+
+
+
+add back on info for reference and make two-column format for rubias
+```{r}
+# baseline
+reference <- two_col %>%
+  left_join(., baseline_spp_info) %>%
+  filter(!is.na(species)) %>%
+  select(-gtseq_run, -id, -species) %>%
+  select(sample_type, repunit, collection, indiv, everything())
+
+```
+
+```{r}
+# mixture
+rubias_mix <- two_col %>%
+  anti_join(., baseline_spp_info) %>%
+  select(-gtseq_run) %>%
+  mutate(sample_type = "mixture", collection = "blackspotted_rougheye", repunit = NA) %>%
+  select(sample_type, repunit, collection, everything()) %>%
+  rename(indiv = id)
+```
+
+## Mixture assignment with rubias
+
+
+```{r run-rubias}
+rubias_output <- infer_mixture(reference = reference, mixture = rubias_mix, gen_start_col = 5)
+
+# mixing proportions
+rubias_output$mixing_proportions %>%
+  ggplot(aes(x = collection, y = pi)) +
+  geom_bar(stat = "identity") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.95)
+  )
+
+```
+
+
+
+
+```{r individual-posteriors}
+# take the top output for each sample
+top_assign <- rubias_output$indiv_posteriors %>%
+  group_by(indiv) %>%
+  slice_max(., order_by = PofZ)
+
+
+top_assign 
+```
+
+```{r summary}
+top_assign %>%
+  filter(z_score < -3 | z_score > 3)
+
+```
+
+A few z-score outliers. Interesting.
+
+```{r}
+top_assign %>%
+  group_by(collection) %>%
+  tally()
+
+```
+
+
+### add metadata
+
+```{r read-in-samplesheet-and-metadata}
+
+# samplesheet
+ss <- read_csv("../data_AFSC/samplesheets/20230613_pcod_rockfish.csv", skip = 19)
+
+# metadata
+meta <- read_xlsx("../data_AFSC/20230615_database_export.xlsx")
+
+meta$ABLG <- as.character(meta$ABLG)
+
+meta %>%
+  filter(Family == "Sebastidae" | str_detect(SpeciesName, "Sebastes")) %>%
+  write_rds("../data_AFSC/sebastes_metadata_export.rds")
+
+# read in just the sebastes metadata because the entire database export is enormous
+meta1 <- read_rds("../data_AFSC/sebastes_metadata_export.rds")
+
+# stick the samplesheet together with metadata
+assignments_w_meta <- ss %>%
+  left_join(., meta1, by = c("Sample_ID" = "ABLG")) %>%
+  left_join(., top_assign, by = c("id" = "indiv")) %>%
+  select(Sample_ID, AlternateID_s_, SpeciesName, DonatingLab, StartLatitudeDD, StartLongitudeDD, repunit, PofZ, z_score, n_miss_loci, CollectionDate, CollectionYear, CollectionMonth, CollectionDay, StateCountry, MarineRegion)
+
+
+rock_assigned <-assignments_w_meta %>%
+  #filter(z_score < 3 & z_score > -3) %>%
+  group_by(SpeciesName, repunit) #%>%
+  #tally() 
+  
+```
+
+Take a quick look at the map perspective of those data:
+
+
+```{r map-indiv-data}
+library(ggplot2)
+library(sf)  
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+goa_map <- ggplot(data = world) +
+  geom_sf() +
+  coord_sf(xlim = c(-180, -120), 
+           ylim = c(65, 40), 
+           expand = FALSE) 
+
+goa_map +
+  geom_jitter(data = rock_assigned, aes(x = StartLongitudeDD, y = StartLatitudeDD, color = repunit, shape = SpeciesName), size = 1, alpha = 0.5, width = 0.3, height = 0.3) +
+  scale_color_manual(values = c("darkred", "gold", "salmon", "darkorange", "dodgerblue", "lightblue", "midnightblue")) +
+  theme_bw() +
+  labs(x = "Longitude",
+       y = "Latitude",
+       color = "Species (genetic)",
+       shape = "Species (morphology)") +
+  theme(
+    legend.text = element_text(face = "italic"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+  ) +
+  scale_y_continuous(breaks = c(40, 45, 50, 55, 60, 65)) +
+  scale_x_continuous(breaks = c(-180, -160, -150, -140, -130, -120)) +
+  guides(color = guide_legend(
+    override.aes = list(alpha = 1, size = 3), 
+    label.theme = element_text(size = 12, face = "italic"),
+    title.theme = element_text(size = 14)),
+    shape = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+ggsave("pdf_outputs/blackspotted_rougheye_sppID_map.pdf", width = 6, height = 5)
+
+```
+
+```{r map-wo-bounds}
+ggplot(data = rock_assigned, aes(x = StartLongitudeDD, y = StartLatitudeDD, color = repunit, shape = SpeciesName)) +
+  geom_jitter(size = 1, alpha = 0.5, width = 0.3, height = 0.3) +
+  scale_color_manual(values = c("darkred", "gold", "salmon", "darkorange", "dodgerblue", "lightblue", "midnightblue")) +
+  theme_bw() +
+  labs(x = "Longitude",
+       y = "Latitude",
+       color = "Species (genetic)") +
+  theme(
+    legend.text = element_text(face = "italic"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+  ) +
+  guides(color = guide_legend(
+    override.aes = list(alpha = 1, size = 3), 
+    label.theme = element_text(size = 12, face = "italic"),
+    title.theme = element_text(size = 14)),
+    shape = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+
+
+```
+
+
+```{r output-data-for-comparison}
+# genetic assignments for blackspotted and rougheye
+# rock_assigned %>%
+#   select(-CollectionDate) %>%
+#   rename(GeneticID = repunit, z_score = z_score) %>%
+#   write_csv("csv_outputs/blackspotted_rougheye_sppID.csv")
+
+
+assignments_for_suzanne <- rock_assigned %>%
+  filter(DonatingLab == "Suzanne Romain") %>%
+  mutate(Genus = "Sebastes") %>%
+  select(Sample_ID, AlternateID_s_, SpeciesName, Genus, repunit, z_score, n_miss_loci, everything()) %>%
+  unite(Genus, repunit, col = "Genetic_ID") %>%
+  mutate(Genetic_ID = ifelse(is.na(z_score) | z_score > 3 | z_score < -3, NA, Genetic_ID)) %>%
+  # clean-up the data based on z-scores
+  select(-PofZ)
+
+# take a quick look at the NA genetic IDs
+assignments_for_suzanne %>%
+  filter(is.na(Genetic_ID))
+
+```
+
+What's going on with the five Sebastes spp. samples that came up as NA in the species ID panel? Missing data?
+
+There are 11 samples with no genetic ID
+
+Out of curiosity, how many missing loci did the Sebastes spp. samples have?
+```{r}
+ind_to_toss %>%
+  left_join(ss) %>%
+  left_join(meta1, by = c("Sample_ID" = "ABLG"))
+
+```
+
+Unfortunate that the entire column 7 dropped out (A-H). That included the unknown Sebastes spp. Probably it was just forgotten when pooling.
+
+```{r output-genetic-ids-for-suzanne}
+assignments_for_suzanne %>%
+  select(AlternateID_s_, SpeciesName, Genetic_ID, DonatingLab, Sample_ID) %>%
+  rename(ABLG = Sample_ID, Original_ID = AlternateID_s_) %>%
+  write_csv("csv_outputs/SuzanneRomain_geneticIDs.csv")
+
+```
+
+
+For Wes, we need to update the database with genetic ID
+```{r output-for-Wes}
+rock_assigned %>%
+  ungroup() %>%
+  mutate(Genus = "Sebastes") %>%
+  select(Sample_ID, AlternateID_s_, SpeciesName, Genus, repunit, z_score, n_miss_loci, everything()) %>%
+  unite(Genus, repunit, col = "Genetic_ID") %>%
+  mutate(Genetic_ID = ifelse(is.na(z_score) | z_score > 3 | z_score < -3, NA, Genetic_ID)) %>%
+  rename(ABLG = Sample_ID) %>%
+  select(ABLG, Genetic_ID, StartLongitudeDD, StartLatitudeDD) %>%
+  filter(!is.na(Genetic_ID)) %>%
+  mutate(StartLatitudeDD = ifelse(is.na(StartLongitudeDD), NA, StartLatitudeDD)) %>%
+  write_csv("csv_outputs/blackspottedRougheyeShortrakerGeneticIDs_20230707.csv")
+  
+
+```
+
+## checking ABLG numbers that look weird in Laura's lcWGS data
+
+```{r}
+blackspotted_odd <- c(
+  "ABLG21309",
+  "ABLG21310",
+  "ABLG21312",
+  "ABLG21336")
+
+shortraker_odd <- c(
+  "ABLG26008",
+  "ABLG26039",
+  "ABLG26108")
+
+# reformat those for ease 
+# working on one species at a time
+to_check <- as.data.frame(blackspotted_odd) %>%
+  rename(Sample_ID = blackspotted_odd) %>%
+  mutate(Sample_ID = str_replace(Sample_ID, "ABLG", "")) %>%
+  mutate(sample = "lcwgs_weirdos")
+
+s <- to_check %>%
+  left_join(., rock_assigned)
+
+
+annotations <- data.frame(
+  x = c(round(min(s$z_score), 2), round(mean(s$z_score), 2), round(max(s$z_score), 2)),
+  y = c(4, 14, 3),
+  label = c("Min:", "Mean:", "Max:")
+)
+```
+
+
+```{r blackspotted-outliers-in-lcWGS}
+rock_assigned %>%
+  filter(repunit == "melanostictus",
+         z_score > -5) %>%
+  #z_score < 3 & z_score > -3,
+  left_join(., to_check) %>%
+  filter(!is.na(repunit)) %>%
+  ggplot(aes(x = z_score)) +
+  geom_histogram(fill = "dodgerblue", alpha = 0.75) +
+  #facet_grid(rows = vars(repunit)) +
+  theme_bw() +
+  geom_text(data = annotations, aes(x = x, y = y, label = paste(label, x)), size = 3, fontface = "bold") +
+  geom_vline(xintercept = annotations$x, linetype = "dashed") +
+  labs(title = "Blackspotted lcWGS outliers compared to overall z-score distribution")
+
+
+ggsave("pdf_outputs/blackspotted_lcwgs_outliers_zscores.pdf", width = 7, height = 4)
+```
+
+```{r shortraker}
+to_check <- as.data.frame(shortraker_odd) %>%
+  rename(Sample_ID = shortraker_odd) %>%
+  mutate(Sample_ID = str_replace(Sample_ID, "ABLG", "")) %>%
+  mutate(sample = "lcwgs_weirdos")
+
+s <- to_check %>%
+  left_join(., rock_assigned)
+
+
+annotations <- data.frame(
+  x = c(round(min(s$z_score), 2), round(mean(s$z_score), 2), round(max(s$z_score), 2)),
+  y = c(4, 14, 3),
+  label = c("Min:", "Mean:", "Max:")
+)
+
+rock_assigned %>%
+  filter(repunit == "borealis") %>%
+        # z_score < 3 & z_score > -3) %>%
+  left_join(., to_check) %>%
+  filter(!is.na(repunit)) %>%
+  ggplot(aes(x = z_score)) +
+  geom_histogram(fill = "salmon", alpha = 0.75) +
+  #facet_grid(rows = vars(repunit)) +
+  theme_bw() +
+  geom_text(data = annotations, aes(x = x, y = y, label = paste(label, x)), size = 3, fontface = "bold") +
+  geom_vline(xintercept = annotations$x, linetype = "dashed") +
+  labs(title = "Shortraker lcWGS outliers compared to overall z-score distribution")
+
+
+ggsave("pdf_outputs/shortraker_lcwgs_outliers_zscores.pdf", width = 7, height = 4)
+
+```
+
+
+
+
+Hmmm, nothing out of the ordinary in the assignments for those samples.
+
+Where do those assignments z-scores fall in the scheme of the rest of our samples?
+
+A few notes in summary:
+1) We should add more confirmed blackspotted, rougheye, and shortraker into the species ID panel to improve allele frequency estimates for those species.
+
+2) Could this issue arise from database/cherry-picking issues, i.e., we're not lcWGS the same samples from the species ID panel?
+
+3) Is there a biological explanation for low-rates of misassignment with the species ID panel?
+
+
+
+
+## Read in some lcWGS data for admixture from Laura
+
+```{r lcwgs-data}
+# data output from Laura's sedna analysis
+
+bs_lcwgs_adm <- read_xlsx("../data_AFSC/lcwgs_data_from_laura/BSRE2-7164_metadata_prelim-results.xlsx")
+
+# summarize data with a PCA and the admixture plot
+bs_lcwgs_adm %>%
+  ggplot(aes(x = full_pc1, y = full_pc2, color = MarineRegion_USEME)) +
+  geom_point() +
+  theme_bw() +
+  labs(color = "Region")
+
+```
+
+```{r bs-admixture}
+bs_for_admix <- bs_lcwgs_adm %>%
+  pivot_longer(35:39, names_to = "k_val", values_to = "prop") %>%
+  separate(k_val, into = c("k", "group"), sep = "_") 
+
+bs_for_admix %>%
+  #mutate(prop_grp1 = ifelse())
+  ggplot() +
+  geom_bar(aes(x = reorder(ABLG, prop), y = prop, fill = group), stat = "identity") +
+  facet_grid(rows = vars(k), cols = vars(MarineRegion_USEME), scales = "free_x", space = "free") +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  scale_fill_manual(values = c("darkblue", "seagreen4", "salmon"))
+
+```
+Ok, so supposedly the dark blue ones are rougheye. Does the metadata say as much?
+
+```{r}
+to_remove <- bs_for_admix %>%
+  filter(k == "k2" & group == "1" & prop > 0.5) %>%
+  select(ABLG)
+  
+```
+Ok, so those 6 were not id'ed with the species ID panel.
+
+```{r}
+# order by proportion of group 3
+bs_for_admix %>%
+  anti_join(., to_remove) %>%
+ # mutate(plot_order = ifelse(k == "k3" & group == "3"), "yes", NA) %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(ABLG, prop), y = prop, fill = group), stat = "identity") +
+  facet_grid(rows = vars(k), cols = vars(MarineRegion_USEME), scales = "free_x", space = "free") +
+   theme_bw() +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  scale_fill_manual(values = c("darkblue", "seagreen4", "salmon")) 
+  
+```
+```{r}
+# order by proportion of group 3
+k3_grp_df <- bs_for_admix %>%
+  anti_join(., to_remove) %>%
+  filter(k == "k3") %>%
+  left_join(., bs_lcwgs_adm) 
+
+k3_grp_df %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(ABLG, k3_3), y = prop, fill = group), stat = "identity") +
+  facet_grid(rows = vars(k), cols = vars(MarineRegion_USEME), scales = "free_x", space = "free") +
+   theme_bw() +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  scale_fill_manual(values = c("darkblue", "seagreen4", "salmon")) +
+  labs(
+    x = "individual",
+    y = "proportion ancestry"
+  )
+  
+```
+```{r}
+k3_grp_df %>%
+  filter(k3_3 > 0.01 & k3_3 < 0.9999) %>%
+  ggplot(aes(x = mean_depth, y = k3_3, color = MarineRegion_USEME)) +
+  geom_point() +
+  #stat_summary(fun.data=mean_cl_normal) + 
+  geom_smooth(method='lm', formula= y~x) +
+    theme_bw() +
+  labs(color = "Region",
+        y = "proportion ancestry",
+        x = "mean sequencing depth")
+
+ggsave("pdf_outputs/lcwgs_depth_v_admix_grp.pdf", width = 5, height = 3)
+```
+
+
+# looking at the pca again
+```{r}
+# summarize data with a PCA and the admixture plot
+bs_lcwgs_adm %>%
+  anti_join(., to_remove) %>%
+  ggplot(aes(x = full_pc1, y = full_pc2, color = MarineRegion_USEME)) +
+  geom_point() +
+  geom_text(aes(label = ABLG, vjust = 0.005), size = 3, color = "black") +
+  theme_bw() +
+  labs(color = "Region")
+
+
+```
+The outliers are ABLG:
+21313
+29109
+
+Where do those fall on the admixture plot?
+
+```{r}
+k3_grp_df %>%
+  filter(ABLG %in% c("ABLG21313", "ABLG29109")) %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(ABLG, k3_3), y = prop, fill = group), stat = "identity") +
+  facet_grid(rows = vars(k), cols = vars(MarineRegion_USEME), scales = "free_x", space = "free") +
+   theme_bw() +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  scale_fill_manual(values = c("darkblue", "seagreen4", "salmon")) +
+  labs(
+    x = "individual",
+    y = "proportion ancestry"
+  )
+```
+
+
+
+
+```{r check-read-depth}
+# check relationship between prop group 3 and read depth?
+bs_lcwgs_adm %>%
+  anti_join(., to_remove) %>%
+  ggplot(aes(x = mean_depth, y = full_pc1, color = MarineRegion_USEME)) +
+  geom_point() +
+  geom_text(aes(label = ABLG)) +
+    theme_bw() +
+  labs(color = "Region")
+
+```
+
+```{r}
+bs_lcwgs_adm %>%
+  anti_join(., to_remove) %>%
+  ggplot(aes(x = mean_depth, y = k3_2, color = MarineRegion_USEME)) +
+  geom_point() +
+    theme_bw() +
+  labs(color = "Region")
+```
+
+```{r check-depth-vs-grp-membership}
+bs_for_admix %>%
+  anti_join(., to_remove) %>%
+  filter(k == "k3" & group > 1) %>%
+  filter(prop > 0.01 & prop < 0.9999) %>%
+  ggplot(aes(x = mean_depth, y = prop, color = MarineRegion_USEME)) +
+  geom_point() +
+  facet_grid(rows = vars(group), labeller = "label_both") +
+    theme_bw() +
+  labs(color = "Region",
+       title = "Blackspotted lcWGS, admixture, k=3")
+
+```
+```{r}
+bs_for_admix %>%
+  anti_join(., to_remove) %>%
+  filter(k == "k3") %>%
+  ggplot(aes(x = mean_depth, y = prop, color = MarineRegion_USEME)) +
+  geom_point() +
+  facet_grid(rows = vars(group), labeller = "label_both") +
+    theme_bw() +
+  labs(color = "Region",
+       title = "Blackspotted lcWGS, admixture, k=3")
+
+```
+
+
+
+take a look at geography
+```{r}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+goa_map <- ggplot(data = world) +
+  geom_sf() +
+  coord_sf(xlim = c(min(bs_lcwgs_adm$StartLongitudeDD)-1, max(bs_lcwgs_adm$StartLongitudeDD)), 
+           ylim = c(max(bs_lcwgs_adm$StartLatitudeDD)+1, min(bs_lcwgs_adm$StartLatitudeDD)), 
+           expand = FALSE) 
+
+
+bs_for_map <- bs_lcwgs_adm %>%
+  anti_join(., to_remove)
+
+ goa_map +
+  geom_jitter(data = bs_for_map, aes(x = StartLongitudeDD, y = StartLatitudeDD, color = k3_2), size = 2) +
+  theme_bw() +
+  labs(x = "Longitude",
+       y = "Latitude",
+       color = "Ancestry proportion \ngroup 2 in K=3") +
+  theme(
+    legend.text = element_text(face = "italic"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    panel.grid.major = element_blank()
+  ) 
+
+```
+
